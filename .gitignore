@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+holy-music-key.txt
+holy-music-config.json
+holy-music-tunnel.log
+*.log
