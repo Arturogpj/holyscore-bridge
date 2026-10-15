@@ -4,9 +4,15 @@ Connects your WanGP to the **Holy Score** studio (https://score.holyfstudios.com
 
 ## Install
 
-In WanGP: **Plugin Manager → install from URL** → paste this repository's URL, enable it, and restart WanGP.
+1. In WanGP, open the **Plugins** tab.
+2. Under **Install New Plugin**, paste `https://github.com/Arturogpj/holyscore-bridge` and press **Download and Install Plugin**.
+3. Turn the plugin on and restart WanGP.
+4. Open the new **Holy Score** tab and copy the **pairing key**.
+5. Open https://score.holyfstudios.com, click **WanGP · not connected** (top right), paste the key and press **Connect**.
 
-A **Holy Score** tab appears in WanGP with the address (and a public tunnel address) and the pairing key: paste both into the studio's connect dialog.
+Same PC as WanGP: that's all. Another computer: use the internet address shown in the Holy Score tab (under "WanGP is on another computer" in the studio's Setup).
+
+To update later: the same Plugins tab updates it (then restart WanGP).
 
 ## What it gives the studio (port 7867)
 

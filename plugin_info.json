@@ -1,7 +1,7 @@
 {
   "name": "Holy Score",
   "author": "Holy F Studios",
-  "version": "0.7.1",
+  "version": "0.8.2",
   "description": "Exposes this WanGP to the Holy Score studio: YuE2 recordings (they join the WanGP queue), PrismAudio foley, clip joining and video export on :7867, plus a public tunnel address with copy button.",
   "type": [
     "app"

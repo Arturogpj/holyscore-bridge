@@ -35,7 +35,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 PlugIn_Name = "Holy Score"
 PlugIn_Id = "HolyMusicBridge"
-VERSION = "0.7.1"
+VERSION = "0.8.2"
 
 API_HOST = "127.0.0.1"
 API_PORT = 7867
@@ -689,19 +689,20 @@ def _build_app():
         body = await request.body()
         if len(body) > 50 * 1024 * 1024:
             raise ValueError("recording too long")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+        # every hum is kept (outputs/holy-music/hums) so a bad transcription can be looked at and redone
+        hums = os.path.join(_work, "hums")
+        os.makedirs(hums, exist_ok=True)
+        temp = os.path.join(hums, time.strftime("%Y-%m-%d %Hh%Mm%Ss") + ".wav")
+        with open(temp, "wb") as handle:
             handle.write(body)
-            temp = handle.name
         try:
             result = await _run_sync(lambda: transcribe(
                 temp, bpm=float(q.get("bpm", 90)), offset=float(q.get("offset", 0)), latency=float(q.get("latency", 0)),
                 key=q.get("key", "C"), snap=q.get("snap", "1") == "1", tight=q.get("tight", "1") == "1",
-                grid=float(q.get("grid", 0.25)), transpose=int(float(q.get("transpose", 0)))))
-        finally:
-            try:
-                os.remove(temp)
-            except OSError:
-                pass
+                grid=float(q.get("grid", 0.25)), transpose=int(float(q.get("transpose", 0))), keyfit=q.get("keyfit", "1") == "1"))
+        except Exception:
+            raise
+        result["file"] = _rel(temp)
         return JSONResponse(result)
 
     async def stretch(request):
@@ -712,6 +713,10 @@ def _build_app():
     async def concat(request):
         body = await request.json()
         return JSONResponse(await _run_sync(_concat, list(body.get("files") or [])))
+
+    async def compose(request):
+        body = await request.json()
+        return JSONResponse(await _run_sync(_compose, list(body.get("clips") or []), body.get("duration", 0)))
 
     async def probe(request):
         return JSONResponse(await _run_sync(lambda: _probe(_output_path(request.query_params.get("name", "")))))
@@ -741,6 +746,7 @@ def _build_app():
         Route("/music/mux", guard(mux), methods=["POST"]),
         Route("/music/concat", guard(concat), methods=["POST"]),
         Route("/music/probe", guard(probe)),
+        Route("/music/compose", guard(compose), methods=["POST"]),
         Route("/music/foley", guard(foley), methods=["POST"]),
         Route("/music/shots", guard(shots)),
         Route("/music/transcribe", guard(transcribe_route), methods=["PUT"]),
@@ -822,6 +828,68 @@ def _concat(files):
         pairs.append(f"[v{i}][a{i}]")
     graph = ";".join(chains) + ";" + "".join(pairs) + f"concat=n={len(paths)}:v=1:a=1[v][a]"
     args += ["-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "17",
+             "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", target]
+    subprocess.run(args, check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return {"name": out_name, "duration": _probe(target)["duration"]}
+
+
+def _compose(clips, total):
+    """The film from clips placed on a timeline: each clip (its trimmed stretch) where it sits, black and silence in
+    between and after, every clip fitted to the first one's frame, 30 fps."""
+    import hashlib
+    import subprocess
+
+    import imageio_ffmpeg
+
+    items = sorted(({"path": _output_path(c["file"]), "at": max(0.0, float(c.get("at", 0))), "from": max(0.0, float(c.get("from", 0))),
+                     "to": float(c.get("to", 0))} for c in clips), key=lambda c: c["at"])
+    if not items:
+        raise ValueError("no clips")
+    total = max(float(total or 0), max(c["at"] + c["to"] - c["from"] for c in items))
+    key = hashlib.sha1(("|".join(f'{c["path"]}:{os.path.getmtime(c["path"])}:{c["at"]:.3f}:{c["from"]:.3f}:{c["to"]:.3f}' for c in items) + f"|{total:.3f}").encode()).hexdigest()[:12]
+    out_name = f"holy-music/films/film-{key}.mp4"
+    target = os.path.join(_outputs, *out_name.split("/"))
+    if os.path.isfile(target):
+        return {"name": out_name, "duration": _probe(target)["duration"]}
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    first = _probe(items[0]["path"])
+    w, h = first["width"] // 2 * 2, first["height"] // 2 * 2
+    args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y"]
+    chains, pairs, n = [], [], 0
+
+    def gap(seconds):
+        nonlocal n
+        args.extend(["-f", "lavfi", "-t", f"{seconds:.3f}", "-i", f"color=c=black:s={w}x{h}:r=30",
+                     "-f", "lavfi", "-t", f"{seconds:.3f}", "-i", "anullsrc=r=48000:cl=stereo"])
+        chains.append(f"[{n}:v]setsar=1,format=yuv420p[v{len(pairs)}]")
+        chains.append(f"[{n + 1}:a]anull[a{len(pairs)}]")
+        pairs.append(f"[v{len(pairs)}][a{len(pairs)}]")
+        n += 2
+
+    t = 0.0
+    for c in items:
+        length = max(0.05, c["to"] - c["from"])
+        start = max(c["at"], t)  # clips never overlap: a later one starts after the one before it
+        if start - t > 0.02:
+            gap(start - t)
+        info = _probe(c["path"])
+        args.extend(["-ss", f'{c["from"]:.3f}', "-t", f"{length:.3f}", "-i", c["path"]])
+        i = len(pairs)
+        chains.append(f"[{n}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}]")
+        if info["audio"]:
+            chains.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{length:.3f}[a{i}]")
+            n += 1
+        else:
+            n += 1
+            args.extend(["-f", "lavfi", "-t", f"{length:.3f}", "-i", "anullsrc=r=48000:cl=stereo"])
+            chains.append(f"[{n}:a]anull[a{i}]")
+            n += 1
+        pairs.append(f"[v{i}][a{i}]")
+        t = start + length
+    if total - t > 0.02:
+        gap(total - t)
+    graph = ";".join(chains) + ";" + "".join(pairs) + f"concat=n={len(pairs)}:v=1:a=1[v][a]"
+    args += ["-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
              "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", target]
     subprocess.run(args, check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return {"name": out_name, "duration": _probe(target)["duration"]}

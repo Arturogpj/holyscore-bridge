@@ -26,7 +26,24 @@ def _snap(pitch, scale):
     return pitch
 
 
-def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tight=True, grid=0.25, transpose=0):
+def _tuning(midi_values):
+    """How sharp or flat the singer is overall, in semitones (-0.5..0.5): the circular mean of the fractional parts."""
+    v = np.asarray(midi_values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 10:
+        return 0.0
+    angles = 2 * np.pi * (v - np.round(v))
+    return float(np.angle(np.mean(np.exp(1j * angles))) / (2 * np.pi))
+
+
+def _key_shift(notes, scale):
+    """The transposition (-6..+5 semitones) that puts the most of the melody (by length) into the song's scale; the smallest wins a tie."""
+    def fit(shift):
+        return sum(n["length"] for n in notes if (n["pitch"] + shift) % 12 in scale)
+    return max(range(-6, 6), key=lambda s: (round(fit(s), 6), -abs(s)))
+
+
+def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tight=True, grid=0.25, transpose=0, keyfit=True):
     import librosa
 
     y, sr = librosa.load(path, sr=22050, mono=True)
@@ -36,9 +53,9 @@ def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tigh
     f0, voiced, prob = librosa.pyin(y, fmin=65, fmax=1050, sr=sr, frame_length=1024, hop_length=hop)
     times = librosa.times_like(f0, sr=sr, hop_length=hop)
     rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop)[0][: len(f0)]
-    gate = max(float(np.percentile(rms, 95)) * 0.12, 1e-4)
+    gate = max(float(np.percentile(rms, 95)) * 0.06, 1e-4)  # soft, mouth-closed humming counts too
     midi = librosa.hz_to_midi(np.where(np.isfinite(f0), f0, np.nan))
-    ok = voiced & (prob > 0.35) & (rms > gate) & np.isfinite(midi)
+    ok = (voiced | (prob > 0.15)) & (rms > gate) & np.isfinite(midi)
     # light median smoothing of the pitch curve inside voiced runs
     smooth = midi.copy()
     for i in range(len(midi)):
@@ -59,7 +76,9 @@ def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tigh
         if current is not None:
             center = float(np.median(current["pitches"][-8:]))
             # a new note: an attack (onset) after at least ~60 ms, or a stable pitch move
-            new_attack = i in onset_frames and (i - current["i0"]) * hop / sr > 0.06
+            # a real attack makes the voice louder again after a dip; a wobble in a held note doesn't
+            dip = float(np.min(rms[max(0, i - 6): i])) if i > 0 else 0.0
+            new_attack = i in onset_frames and (i - current["i0"]) * hop / sr > 0.12 and rms[i] > 1.6 * max(dip, 1e-6)
             moved = abs(smooth[i] - center) > 0.75 and all(abs(smooth[j] - center) > 0.6 for j in range(i, min(i + 3, len(smooth))) if ok[j])
             if new_attack or moved:
                 segments.append(current)
@@ -72,17 +91,16 @@ def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tigh
         segments.append(current)
 
     scale = _scale(key)
+    tuning = _tuning(smooth[ok])  # nobody hums exactly at A440
     spq = 60.0 / float(bpm)
     step = float(grid) if tight else 0.125
     notes = []
     for seg in segments:
         t0 = times[seg["i0"]]
         t1 = times[seg["i1"]] + hop / sr
-        if t1 - t0 < 0.07:
+        if t1 - t0 < 0.05:
             continue
-        pitch = int(round(float(np.median(seg["pitches"])))) + int(transpose)
-        if snap:
-            pitch = _snap(pitch, scale)
+        pitch = int(round(float(np.median(seg["pitches"])) - tuning)) + int(transpose)
         q0 = (t0 - latency) / spq + offset
         q1 = (t1 - latency) / spq + offset
         start = round(q0 / step) * step
@@ -94,10 +112,19 @@ def transcribe(path, bpm=90.0, offset=0.0, latency=0.0, key="C", snap=True, tigh
             if last["pitch"] == pitch and start - last["start"] < step * 1.01:
                 last["length"] = max(last["length"], end - last["start"])
                 continue
-            last["length"] = max(step, start - last["start"])
             if start <= last["start"]:
-                continue
+                # two notes landed on the same grid slot: keep both, the second one just after the first
+                start = last["start"] + step
+                end = max(end, start + step)
+            last["length"] = max(step, start - last["start"])
         notes.append({"start": float(start), "length": float(end - start), "pitch": pitch})
 
+    # into the song's key: the whole tune moves together (its intervals stay exactly as hummed); only notes still outside the
+    # key after that get nudged to the nearest one in it
+    shift = _key_shift(notes, scale) if (snap and keyfit and notes) else 0
+    for n in notes:
+        n["pitch"] += shift
+        if snap:
+            n["pitch"] = _snap(n["pitch"], scale)
     trace = [[round(float(times[i]), 3), round(float(smooth[i]), 2) if ok[i] else None] for i in range(0, len(times), 2)]
-    return {"notes": notes, "trace": trace, "duration": round(len(y) / sr, 2)}
+    return {"notes": notes, "trace": trace, "duration": round(len(y) / sr, 2), "shift": shift, "tuning": round(tuning, 2)}
