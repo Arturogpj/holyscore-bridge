@@ -35,7 +35,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 PlugIn_Name = "Holy Score"
 PlugIn_Id = "HolyMusicBridge"
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 
 API_HOST = "127.0.0.1"
 API_PORT = 7867
@@ -337,6 +337,52 @@ def _wangp_busy():
     return bool(gen.get("in_progress")) or bool(gen.get("queue"))
 
 
+def _listen_submit(body):
+    """What a recording actually plays, written back as a score: YuE2's own transcriber (SheetSage2 + MERT2) listens to it."""
+    audio = _output_path(body.get("audio", ""))
+    job_id = uuid.uuid4().hex[:12]
+    record = {"id": job_id, "kind": "listen", "status": "running", "createdAt": time.time(),
+              "settings": {"model": "SheetSage2", "audio": body.get("audio", "")},
+              "progress": None, "statusText": "Starting...", "log": [], "files": [], "errors": [], "song": None}
+    _register(record)
+    threading.Thread(target=_listen_run, args=(record, audio), name=f"holy-music-listen-{job_id}", daemon=True).start()
+    return record
+
+
+def _listen_run(record, audio):
+    try:
+        while _wangp_busy():
+            if record.get("cancel"):
+                record.update(status="cancelled", finishedAt=time.time())
+                return
+            record["statusText"] = "Waiting for WanGP to finish what it's doing..."
+            time.sleep(1)
+        with _gpu_gate:
+            import importlib
+
+            from shared.utils import offload_registry
+            from shared.utils import files_locator as fl
+
+            offload_registry.unload_vram()  # whatever WanGP left in VRAM goes back to RAM first
+            scoring = importlib.import_module("models.TTS.yue2.sheetsage2.scoring")
+            checkpoint = fl.locate_file(os.path.join("sheetsage2", "SheetSage2_MERT2_bf16.safetensors"))
+
+            def progress(step_idx=0, override_num_inference_steps=None, progress_title="Listening", **_):
+                total = override_num_inference_steps or 0
+                record["progress"] = {"phase": progress_title, "status": progress_title, "percent": int(100 * (step_idx + 1) / total) if total else 0, "step": step_idx + 1, "total": total}
+                record["statusText"] = progress_title
+
+            abc, _midi = scoring.score_audio(audio, checkpoint, False, progress, lambda: bool(record.get("cancel")))
+        from holy_music_score import parse_abc
+
+        record["song"] = parse_abc(abc)
+        record["abc"] = abc
+        record.update(status="done", statusText="Done", finishedAt=time.time())
+    except Exception as exc:  # report, never crash WanGP
+        _log(f"listen failed: {exc}")
+        record.update(status="error", errors=[str(exc) or exc.__class__.__name__], finishedAt=time.time())
+
+
 def _foley_submit(body):
     """Diegetic sound for a stretch of the video, made by PrismAudio from the picture and a description."""
     video = _output_path(body.get("video", ""))
@@ -622,6 +668,10 @@ def _build_app():
     async def shots(request):
         return JSONResponse(await _run_sync(_shots, request.query_params.get("video", "")))
 
+    async def listen(request):
+        body = await request.json()
+        return JSONResponse(_job_view(await _run_sync(_listen_submit, body)))
+
     async def foley(request):
         body = await request.json()
         return JSONResponse(_job_view(await _run_sync(_foley_submit, body)))
@@ -748,6 +798,7 @@ def _build_app():
         Route("/music/probe", guard(probe)),
         Route("/music/compose", guard(compose), methods=["POST"]),
         Route("/music/foley", guard(foley), methods=["POST"]),
+        Route("/music/listen", guard(listen), methods=["POST"]),
         Route("/music/shots", guard(shots)),
         Route("/music/transcribe", guard(transcribe_route), methods=["PUT"]),
     ]
